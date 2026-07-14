@@ -92,6 +92,11 @@ export function getSpanStartTime(span: TraceSpan): number | undefined {
   return state?.startTime;
 }
 
+export function getSpanTraceId(span: TraceSpan): string | undefined {
+  const state = (span as unknown as Record<string | symbol, unknown>)[OTEL_STATE] as OtelSpanState | undefined;
+  return state?.traceId;
+}
+
 /**
  * Inject W3C traceparent header for the current span into the given headers.
  * Returns headers unchanged if not within a span (graceful degradation).
