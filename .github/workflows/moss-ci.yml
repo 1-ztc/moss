@@ -119,16 +119,6 @@ jobs:
           MOSS_CI_JUDGE_API_KEY: ${{ secrets.MOSS_CI_JUDGE_API_KEY }}
         run: moss-ci run "$SUITE_DIR/moss_capabilities.yaml" --no-fail-fast ${{ steps.layer.outputs.tag_arg }}
 
-      - name: Restore last run for diff
-        id: restore-last
-        if: always()
-        uses: actions/cache/restore@v4
-        with:
-          path: /tmp/moss-ci/last.json
-          key: moss-ci-last-${{ github.ref }}-${{ steps.layer.outputs.layer_label }}
-          restore-keys: |
-            moss-ci-last-${{ github.ref }}-
-
       - name: Export current run
         # `moss-ci run` exits non-zero when tests fail (exit 1) — without
         # `if: always()` this step is skipped on failure, so current.json is
@@ -140,6 +130,52 @@ jobs:
         env:
           PYTHONUTF8: '1'
         run: moss-ci export -o /tmp/moss-ci/current.json
+
+      - name: Show per-test results
+        # `moss-ci run` only prints the summary table — on a red run that
+        # leaves "1 failed" with no way to see WHICH test failed or what the
+        # judge scored (F1). Print per-test status + judge scores from the
+        # exported JSON directly into the log, and also upload it as an
+        # artifact for offline inspection of flake runs / full detail.
+        if: always()
+        env:
+          PYTHONUTF8: '1'
+        run: |
+          python - <<'PY'
+          import json
+          try:
+              d = json.load(open("/tmp/moss-ci/current.json", encoding="utf-8"))
+          except FileNotFoundError:
+              print("(no current.json — run failed before export)")
+              raise SystemExit(0)
+          print(f"\n=== {d.get('summary','')} (run {d.get('run_id','')}) ===")
+          for s in d.get("suites", []):
+              for t in s.get("tests", []):
+                  evals = " ".join(
+                      f"{e['type']}={'pass' if e['passed'] else 'fail'}" +
+                      (f"(score={e['score']})" if e.get('score') is not None else "") +
+                      (f" err={e['error']!r}" if e.get('error') else "")
+                      for e in t.get("evals", []))
+                  print(f"  {t['status']:6} {t['test_name']}  [{evals}]")
+          PY
+
+      - name: Upload run result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: moss-ci-run-${{ steps.layer.outputs.layer_label }}
+          path: /tmp/moss-ci/current.json
+          if-no-files-found: ignore
+
+      - name: Restore last run for diff
+        id: restore-last
+        if: always()
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/moss-ci/last.json
+          key: moss-ci-last-${{ github.ref }}-${{ steps.layer.outputs.layer_label }}
+          restore-keys: |
+            moss-ci-last-${{ github.ref }}-
 
       - name: Regression diff vs last run
         # Same reason as Export: the diff is most valuable exactly when tests
