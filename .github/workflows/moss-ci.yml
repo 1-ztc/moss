@@ -135,8 +135,8 @@ jobs:
         # `moss-ci run` only prints the summary table — on a red run that
         # leaves "1 failed" with no way to see WHICH test failed or what the
         # judge scored (F1). Print per-test status + judge scores from the
-        # exported JSON directly into the log, and also upload it as an
-        # artifact for offline inspection of flake runs / full detail.
+        # exported JSON directly into the log. For flake tests, also show
+        # each run's verdict + judge score (F1 runs 3x with a judge each).
         if: always()
         env:
           PYTHONUTF8: '1'
@@ -151,19 +151,27 @@ jobs:
           print(f"\n=== {d.get('summary','')} (run {d.get('run_id','')}) ===")
           for s in d.get("suites", []):
               for t in s.get("tests", []):
-                  evals = " ".join(
-                      f"{e['type']}={'pass' if e['passed'] else 'fail'}" +
-                      (f"(score={e['score']})" if e.get('score') is not None else "") +
-                      (f" err={e['error']!r}" if e.get('error') else "")
-                      for e in t.get("evals", []))
+                  def _fmt(e):
+                      bits = [f"{e['type']}={'pass' if e['passed'] else 'fail'}"]
+                      if e.get('score') is not None:
+                          bits.append(f"score={e['score']}")
+                      if e.get('error'):
+                          bits.append(f"err={e['error']!r}")
+                      return " ".join(bits)
+                  evals = " ".join(_fmt(e) for e in t.get("evals", []))
                   print(f"  {t['status']:6} {t['test_name']}  [{evals}]")
+                  for i, r in enumerate(t.get("flake_runs") or []):
+                      revals = " ".join(_fmt(e) for e in r.get("evals", []))
+                      print(f"        run{i} {r['status']:6} [{revals}]")
           PY
 
       - name: Upload run result artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: moss-ci-run-${{ steps.layer.outputs.layer_label }}
+          # layer_label contains "quick (push/PR)" — parens/space aren't valid
+          # in artifact names, so use the event_name (stable + filesystem-safe).
+          name: moss-ci-run-${{ github.event_name }}
           path: /tmp/moss-ci/current.json
           if-no-files-found: ignore
 
