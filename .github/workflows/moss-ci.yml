@@ -109,44 +109,6 @@ jobs:
             echo "layer_label=quick (push/PR)" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Probe judge endpoint reachability
-        # Quick connectivity probe BEFORE the 9-min Moss run. judge (F1) hits
-        # the Anthropic-protocol endpoint at llmapi.horizon.auto; a previous
-        # run showed httpx.ConnectTimeout from the GitHub runner. This step
-        # checks DNS + a short curl + a 30s judge call so we know up front
-        # whether CI can reach the endpoint at all.
-        env:
-          PYTHONUTF8: '1'
-          MOSS_CI_JUDGE_API_URL: ${{ secrets.MOSS_CI_JUDGE_API_URL }}
-          MOSS_CI_JUDGE_API_KEY: ${{ secrets.MOSS_CI_JUDGE_API_KEY }}
-        run: |
-          echo "=== DNS resolution ==="
-          getent hosts llmapi.horizon.auto || nslookup llmapi.horizon.auto 2>&1 | tail -5 || true
-          echo "=== curl probe (15s timeout, headers only) ==="
-          curl -sS -o /dev/null -w "http_code=%{http_code} connect=%{time_connect}s total=%{time_total}s\n" \
-            --connect-timeout 15 --max-time 30 \
-            https://llmapi.horizon.auto/v1/messages || echo "curl failed (exit $?)"
-          echo "=== judge call probe (30s timeout) ==="
-          python - <<'PY'
-          import asyncio, os, traceback
-          from moss_ci.evaluator.llm_judge import LLMJudgeEvaluator
-          async def m():
-              ev = LLMJudgeEvaluator()
-              # Monkeypatch the client timeout to 30s so we don't wait 2 min.
-              import httpx
-              orig = httpx.AsyncClient
-              def fast(*a, **k):
-                  k['timeout'] = httpx.Timeout(30)
-                  return orig(*a, **k)
-              httpx.AsyncClient = fast
-              try:
-                  score = await ev._call_judge("HORIZON-GLM", "Reply with: {\"score\": 5}")
-                  print("JUDGE OK, score =", score)
-              except Exception as e:
-                  print("JUDGE FAIL:", type(e).__name__, repr(e))
-          asyncio.run(m())
-          PY
-
       - name: Run capability suite
         env:
           PYTHONUTF8: '1'
@@ -190,6 +152,9 @@ jobs:
           for s in d.get("suites", []):
               for t in s.get("tests", []):
                   def _fmt(e):
+                      if e.get('skipped'):
+                          msg = e.get('error') or 'skipped'
+                          return f"{e['type']}=SKIP({msg})"
                       bits = [f"{e['type']}={'pass' if e['passed'] else 'fail'}"]
                       if e.get('score') is not None:
                           bits.append(f"score={e['score']}")
