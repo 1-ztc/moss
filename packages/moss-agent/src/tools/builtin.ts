@@ -28,6 +28,7 @@ import { createWebSearchTool } from './web-search.js';
 import { createBrowserTools } from './browser-tools.js';
 import { backgroundExecTools } from './background-exec.js';
 import { codeDiagnosticsTool } from './code-diagnostics.js';
+import { inspectMonitoringTool } from './inspect-monitoring.js';
 import { visionAnalyzeTool } from '../vision/vision-tool.js';
 import { screenshotCaptureTool } from './screenshot-capture.js';
 import { batchDeviceTool } from './batch-device.js';
@@ -410,6 +411,7 @@ export const builtinTools: Tool[] = [
   ...gitTools,
   undoTool,
   codeDiagnosticsTool,
+  inspectMonitoringTool,
   createSubagentTool,
   fanOutSubagentsTool,
   subagentStatusTool,

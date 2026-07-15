@@ -37,7 +37,7 @@ import {
 import { compactHistoryIfNeeded, type SummarizeFn } from '../../context/compaction.js';
 import { createRemoteCompactProviderFromEnv } from '../../context/remote-compaction.js';
 import { setTraceRedactor, getTracer } from '../../observability/tracing.js';
-import { mossMetrics, getSpanStartTime, getOtelUrl } from '../../observability/index.js';
+import { mossMetrics, getSpanStartTime, getOtelUrl, getSpanTraceId } from '../../observability/index.js';
 import {
   PlatformExtensionRegistry,
   createAgentExtensionRegistryFromDefaults,
@@ -1371,10 +1371,84 @@ export class MossAgent {
 
 
 
-  private notifyRunObserver(
+  private async generateAiInsight(
+    summary: { userMessage: string; outcome: string; toolCalls: number; tokensIn: number; tokensOut: number; errorDetail?: string },
+    traceId: string,
+    otelUrl: string,
+  ): Promise<string | undefined> {
+    try {
+      const baseUrl = otelUrl.replace(/\/v1\/traces\/?$/, '');
+      await new Promise<void>((r) => setTimeout(r, 1500));
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 3000);
+      const res = await fetch(`${baseUrl}/api/traces/${traceId}`, { signal: ctrl.signal });
+      clearTimeout(timer);
+      if (!res.ok) return undefined;
+      const data = (await res.json()) as { traces?: Array<Record<string, unknown>> };
+      const spans = data.traces ?? [];
+      if (spans.length === 0) return undefined;
+      const traceBrief = spans
+        .map((s: any) => `${s.name}(${s.duration}ms, ${s.status}${s.statusMessage ? ': ' + s.statusMessage : ''}${s.toolName ? ', tool=' + s.toolName : ''})`)
+        .join(' | ');
+      const isAbnormal = summary.outcome !== 'completed' || spans.some((s: any) => s.status === 'error');
+      const instruction = isAbnormal
+        ? '你是可观测性分析师。下面是这轮对话的 trace。请用中文分点详细诊断:①失败定位 ②失败原因(基于 statusMessage/errorDetail,不编造) ③最慢点 ④上下文 ⑤排查建议。'
+        : '你是可观测性分析师。下面是这轮对话的 trace。请用一句中文人话总结这轮发生了什么,只输出那句总结。';
+      const prompt = `${instruction}\ntrace spans: ${traceBrief}\n会话摘要: 用户问「${summary.userMessage.slice(0, 200)}」,结果 ${summary.outcome},工具调用 ${summary.toolCalls} 次,token 入${summary.tokensIn}/出${summary.tokensOut}${summary.errorDetail ? ',错误: ' + String(summary.errorDetail).slice(0, 200) : ''}`;
+      const llm = (this.config as { llmProvider?: { complete?: (opts: unknown) => Promise<{ content?: Array<{ type: string; text?: string }> | string }> } }).llmProvider;
+      const model = String(this.config.model ?? 'default');
+      if (!llm?.complete) return undefined;
+      const resp = await llm.complete({
+        model,
+        messages: [
+          { role: 'system', content: '你是可观测性分析师,把 trace 解读成中文人话。' },
+          { role: 'user', content: prompt },
+        ],
+        maxTokens: isAbnormal ? 800 : 400,
+      });
+      const content = resp.content;
+      let text = '';
+      if (typeof content === 'string') text = content;
+      else if (Array.isArray(content)) text = content.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('');
+      text = text.trim();
+      if (text) return text.slice(0, 800);
+      return this.generateRuleInsight(spans, summary);
+    } catch {
+      return this.generateRuleInsight([], summary);
+    }
+  }
+
+  private generateRuleInsight(
+    spans: Array<Record<string, unknown>>,
+    summary: { outcome: string; errorDetail?: string; toolCalls: number; userMessage?: string },
+  ): string | undefined {
+    try {
+      const failed = spans.filter((s: any) => s.status === 'error');
+      const slowest = spans.reduce((sl: any, s: any) => ((s.duration ?? 0) > (sl?.duration ?? 0) ? s : sl), null);
+      if (failed.length > 0) {
+        const f = failed[0] as any;
+        const where = `${f.name ?? 'span'}${f.toolName ? '/' + f.toolName : ''}`;
+        const reason = f.statusMessage || summary.errorDetail || '未知';
+        const slow = slowest ? `,最慢 ${slowest.name} ${slowest.duration}ms` : '';
+        return `🔍 [规则诊断] 失败定位: ${where};原因: ${String(reason).slice(0, 100)}${slow}。`;
+      }
+      if (summary.outcome !== 'completed') {
+        return `🔍 [规则诊断] 会话结果 ${summary.outcome};原因: ${String(summary.errorDetail || '异常终止').slice(0, 100)}。`;
+      }
+      const tools = spans.filter((s: any) => s.name === 'tool.execute');
+      const toolNames = tools.map((t: any) => t.toolName).filter(Boolean);
+      const toolPart = toolNames.length ? `调了 ${toolNames.join('/')} 工具` : '未调工具';
+      const slowPart = slowest?.duration ? `,最慢 ${slowest.name} ${slowest.duration}ms` : '';
+      return `🔍 [规则总结] 用户问「${(summary.userMessage || '').slice(0, 50)}」,${toolPart}${slowPart}。`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async notifyRunObserver(
     run: AgentLoopRun,
     done: Extract<MossAgentEvent, { type: 'done' }>
-  ): void {
+  ): Promise<void> {
     try {
       if (run.sessionKey.startsWith('subagent:')) return;
       const stopReason = done.result.stopReason;
@@ -1392,6 +1466,7 @@ export class MossAgent {
       const summary = {
         sessionKey: run.sessionKey,
         runId: run.params.runId,
+        traceId: run.params.parentSpan ? getSpanTraceId(run.params.parentSpan) : undefined,
         userMessage: run.userMessage,
         assistantSummary: (done.result.response ?? '').slice(0, 500),
         toolsUsed: done.result.toolCalls.map((call) => call.name),
@@ -1407,6 +1482,12 @@ export class MossAgent {
       // (the env path is what CLI sets, so both stay supported).
       const otelUrl = getOtelUrl() ?? process.env.MOSS_OTEL_URL;
       if (otelUrl) {
+        // AI insight: pull this turn's trace, ask LLM (fall back to rules if empty/failed).
+        const traceId = summary.traceId;
+        if (traceId) {
+          const insight = await this.generateAiInsight(summary, traceId, otelUrl);
+          if (insight) (summary as Record<string, unknown>).aiInsight = insight;
+        }
         const baseUrl = otelUrl.replace(/\/v1\/traces\/?$/, '');
         void fetch(`${baseUrl}/v1/session-summary`, {
           method: 'POST',
@@ -1442,7 +1523,7 @@ export class MossAgent {
     const { state } = run;
 
     
-    this.notifyRunObserver(run, done);
+    await this.notifyRunObserver(run, done);
 
     
     if (state.taskFrame.status === 'active' || done.result.response.trim()) {
